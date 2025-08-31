@@ -1,97 +1,6 @@
 require 'securerandom'
 require 'thread'
-
-class MinHeap
-  def initialize
-    @arr = []
-    @index_map = {} 
-  end
-
-  def peek
-    @arr[0]
-  end
-
-  def push(ts, key)
-    if @index_map.key?(key)
-      update(key, ts)
-      return
-    end
-    @arr << [ts, key]
-    idx = @arr.size - 1
-    @index_map[key] = idx
-    sift_up(idx)
-  end
-
-  def pop
-    return nil if @arr.empty?
-    top = @arr[0]
-    remove_at(0)
-    top
-  end
-
-  def remove(key)
-    return unless @index_map.key?(key)
-    remove_at(@index_map[key])
-  end
-
-  def update(key, new_ts)
-    idx = @index_map[key]
-    return unless idx
-    old_ts = @arr[idx][0]
-    @arr[idx][0] = new_ts
-    if new_ts < old_ts
-      sift_up(idx)
-    else
-      sift_down(idx)
-    end
-  end
-
-  private
-
-  def swap(i, j)
-    @arr[i], @arr[j] = @arr[j], @arr[i]
-    @index_map[@arr[i][1]] = i
-    @index_map[@arr[j][1]] = j
-  end
-
-  def sift_up(i)
-    while i > 0
-      parent = (i - 1) / 2
-      break if @arr[parent][0] <= @arr[i][0]
-      swap(i, parent)
-      i = parent
-    end
-  end
-
-  def sift_down(i)
-    n = @arr.size
-    loop do
-      l = 2 * i + 1
-      r = 2 * i + 2
-      smallest = i
-      smallest = l if l < n && @arr[l][0] < @arr[smallest][0]
-      smallest = r if r < n && @arr[r][0] < @arr[smallest][0]
-      break if smallest == i
-      swap(i, smallest)
-      i = smallest
-    end
-  end
-
-  def remove_at(i)
-    last = @arr.size - 1
-    key = @arr[i][1]
-    if i == last
-      @arr.pop
-      @index_map.delete(key)
-      return
-    end
-    swap(i, last)
-    @arr.pop
-    @index_map.delete(key)
-    sift_up(i)
-    sift_down(i)
-  end
-end
+require_relative 'min_heap'
 
 # KeyStore: generates and manages keys with expiry, blocking, unblocking, deletion and keep-alive.
 class KeyStore
@@ -152,7 +61,7 @@ class KeyStore
     @mutex.synchronize do
       meta = @keys[key]
       return false unless meta && !meta[:deleted]
-      # If it was blocked, remove block entry
+      # If it is blocked, then we will remove block entry
       if meta[:blocked]
         meta[:blocked] = false
         meta[:blocked_until] = nil
@@ -262,41 +171,47 @@ class KeyStore
   # Background thread: processes expiry and block-release, using heaps (no O(n) per endpoint).
   def start_background_thread
     Thread.new do
-      Thread.current.abort_on_exception = true
-      loop do
-        now = Time.now.to_f
-        @mutex.synchronize do
-          while (top = @expiry_heap.peek) && top[0] <= now
-            _, expired_key = @expiry_heap.pop
-            meta = @keys[expired_key]
-            next unless meta && !meta[:deleted]
-            # purge expired key
-            meta[:deleted] = true
-            remove_from_available(expired_key)
-            # ensure blocked count and block heap are cleaned
-            if meta[:blocked]
-              @blocked_count -= 1 if @blocked_count > 0
-              @block_heap.remove(expired_key)
+      begin
+        loop do
+          now = Time.now.to_f
+          @mutex.synchronize do
+            while (top = @expiry_heap.peek) && top[0] <= now
+              _, expired_key = @expiry_heap.pop
+              meta = @keys[expired_key]
+              next unless meta && !meta[:deleted]
+              # purge expired key
+              meta[:deleted] = true
+              remove_from_available(expired_key)
+              # ensure blocked count and block heap are cleaned
+              if meta[:blocked]
+                @blocked_count -= 1 if @blocked_count > 0
+                @block_heap.remove(expired_key)
+              end
+              @keys.delete(expired_key)
             end
-            @keys.delete(expired_key)
-          end
 
-          # Process blocked keys whose block time expired => auto-release
-          while (top = @block_heap.peek) && top[0] <= now
-            _, releasing_key = @block_heap.pop
-            meta = @keys[releasing_key]
-            next unless meta && !meta[:deleted]
-            if meta[:blocked]
-              meta[:blocked] = false
-              meta[:blocked_until] = nil
-              @blocked_count -= 1 if @blocked_count > 0
-              meta[:expiry] = now + @expiry_seconds
-              @expiry_heap.update(releasing_key, meta[:expiry])
-              add_to_available(releasing_key)
+            # Process blocked keys whose block time expired => auto-release
+            while (top = @block_heap.peek) && top[0] <= now
+              _, releasing_key = @block_heap.pop
+              meta = @keys[releasing_key]
+              next unless meta && !meta[:deleted]
+              if meta[:blocked]
+                meta[:blocked] = false
+                meta[:blocked_until] = nil
+                @blocked_count -= 1 if @blocked_count > 0
+                meta[:expiry] = now + @expiry_seconds
+                @expiry_heap.update(releasing_key, meta[:expiry])
+                add_to_available(releasing_key)
+              end
             end
           end
+          sleep @poll_interval
         end
-        sleep @poll_interval
+      rescue => e
+        # Log the error (replace with proper logging in production)
+        puts "Background thread error: #{e.message}\n#{e.backtrace.join("\n")}"
+        sleep 5  # Backoff to prevent tight loop on repeated failures
+        retry    # Restart the loop
       end
     end
   end
